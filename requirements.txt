@@ -1,0 +1,11 @@
+# Required dependencies
+dnspython>=2.0.0
+
+# Optional dependencies for enhanced functionality
+rich>=13.0.0
+requests>=2.28.0
+
+# Development/testing dependencies (optional)
+pytest>=7.0.0
+black>=22.0.0
+flake8>=5.0.0
