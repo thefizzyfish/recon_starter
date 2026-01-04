@@ -1289,7 +1289,14 @@ def run_enrichment_checks(live_hosts: List[Dict[str, Any]], raw_dir: Path,
         '/api',
         '/v1',
         '/v2',
-        '/graphql'
+        '/graphql',
+        '/.git',
+        '/.env',
+        '/admin',
+        '/login',
+        '/wp-admin',
+        '/wp-login.php',
+        '/sitemap.xml'
     ]
 
     session = requests.Session()
