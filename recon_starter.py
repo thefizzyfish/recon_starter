@@ -1795,11 +1795,11 @@ def create_manual_review_outputs(consolidated_results: List[Dict[str, Any]],
 
                 # Override signals
                 if host_data.get('overrides'):
-                    f.write(f"**⚠️ Override Signals:** {', '.join(host_data.get('overrides', []))}\n\n")
+                    f.write(f"** Override Signals:** {', '.join(host_data.get('overrides', []))}\n\n")
 
                 # High-value hits
                 if host_data.get('high_value_hits'):
-                    f.write(f"**🎯 High-value Hits:** {', '.join(host_data.get('high_value_hits', []))}\n\n")
+                    f.write(f"** High-value Hits:** {', '.join(host_data.get('high_value_hits', []))}\n\n")
 
                 f.write(f"**All Signals:** {', '.join(host_data.get('signals', []))}\n\n")
 
