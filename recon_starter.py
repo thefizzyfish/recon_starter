@@ -1287,9 +1287,19 @@ def run_enrichment_checks(live_hosts: List[Dict[str, Any]], raw_dir: Path,
         '/.well-known/security.txt',
         '/.well-known/openid-configuration',
         '/api',
+        '/api/v1',
+        '/api/v2',
         '/v1',
         '/v2',
         '/graphql',
+        '/health',
+        '/health/ready',
+        '/healthcheck',
+        '/metrics',
+        '/status',
+        '/swagger.json',
+        '/openapi.json',
+        '/oauth/authorize',
         '/.git',
         '/.env',
         '/admin',
@@ -1560,141 +1570,165 @@ def discover_js_endpoints(base_url: str, session: requests.Session,
 
 
 def calculate_host_score(host_data: Dict[str, Any], enrichment_data: Dict[str, Any]) -> Tuple[int, List[str]]:
-    """Calculate security score for a host based on rubric (0-15)"""
+    """Calculate practical ranking score for a host
+
+    New approach:
+    - Base score from responding endpoints
+    - Bonus for high-value paths
+    - Override signals for immediate attention
+    - Penalties for low-signal indicators
+    - Uniqueness/rarity boost
+    """
     score = 0
     signals = []
+    overrides = []
+    high_value_hits = []
 
     http_results = host_data.get('http', [])
     if not http_results:
         return score, signals
 
-    # Category 1: Accessibility (0-3)
-    if host_data.get('dns', {}).get('a_records') or host_data.get('dns', {}).get('aaaa_records'):
-        score += 1
-        signals.append("dns_resolves")
+    endpoint_checks = enrichment_data.get('endpoint_checks', {})
 
-    if http_results:
-        score += 1
-        signals.append("http_responds")
+    # High-value paths that get significant bonuses
+    high_value_paths = {
+        '/admin': 4,
+        '/wp-admin': 3,
+        '/graphql': 3,
+        '/api': 2,
+        '/api/v1': 2,
+        '/api/v2': 2,
+        '/.env': 4,
+        '/.git': 3,
+        '/swagger.json': 3,
+        '/openapi.json': 3,
+        '/oauth/authorize': 3,
+        '/metrics': 2,
+        '/health': 1,
+        '/status': 1
+    }
 
-    # Check for HTTPS
-    has_https = any(http.get('scheme') == 'https' for http in http_results)
-    if has_https or any(http.get('tls') for http in http_results):
-        score += 1
-        signals.append("https_available")
+    # Override signals that immediately flag for manual review
+    override_indicators = {
+        'auth_wall': [401, 403],  # Authentication required
+        'server_error': range(500, 600),  # Server errors
+        'admin_access': ['/admin', '/wp-admin'],
+        'config_exposure': ['/.env', '/.git'],
+        'api_discovery': ['/graphql', '/swagger.json', '/openapi.json']
+    }
 
-    # Category 2: Status code signals (0-3)
-    status_scores = 0
-    for http in http_results:
-        status = http.get('status', 0)
-        if status in [401, 403]:
-            status_scores = max(status_scores, 2)
-            signals.append(f"auth_required_{status}")
-        elif 500 <= status <= 599:
-            status_scores = max(status_scores, 2)
-            signals.append(f"server_error_{status}")
-        elif 300 <= status <= 399:
-            location = http.get('headers', {}).get('location', '')
-            if any(auth_term in location.lower() for auth_term in ['login', 'oauth', 'sso', 'auth']):
-                status_scores = max(status_scores, 1)
-                signals.append("redirect_to_auth")
+    # Base score: 1 point per meaningful response (not 404s)
+    responding_endpoints = 0
+    for path, result in endpoint_checks.items():
+        status = result.get('status', 0)
+        # Only count meaningful responses: success (2xx, 3xx) or security-relevant (401, 403, 5xx)
+        if status in range(200, 400) or status in [401, 403] or status in range(500, 600):
+            responding_endpoints += 1
 
-    score += min(status_scores, 3)
+            # High-value path bonuses (only for meaningful responses)
+            if path in high_value_paths:
+                bonus = high_value_paths[path]
+                score += bonus
+                high_value_hits.append(f"{path}(+{bonus})")
+                signals.append(f"high_value_path_{path.replace('/', '_').replace('.', '_')}")
 
-    # Category 3: Auth & trust boundaries (0-4)
-    auth_scores = 0
+    score += responding_endpoints
+    if responding_endpoints > 0:
+        signals.append(f"responding_endpoints_{responding_endpoints}")
 
-    # Check for login indicators in titles or redirects
+    # Override detection
+    for indicator_type, criteria in override_indicators.items():
+        triggered = False
+
+        if indicator_type in ['auth_wall', 'server_error']:
+            for result in endpoint_checks.values():
+                status = result.get('status', 0)
+                if (indicator_type == 'auth_wall' and status in criteria) or \
+                   (indicator_type == 'server_error' and status in criteria):
+                    overrides.append(indicator_type)
+                    signals.append(f"override_{indicator_type}")
+                    triggered = True
+                    break
+
+        elif indicator_type in ['admin_access', 'config_exposure', 'api_discovery']:
+            for path in criteria:
+                if path in endpoint_checks and endpoint_checks[path].get('status', 0) > 0:
+                    overrides.append(indicator_type)
+                    signals.append(f"override_{indicator_type}")
+                    break
+
+    # Authentication and technology detection bonuses
+    auth_bonus = 0
     for http in http_results:
         title = http.get('title', '').lower()
-        location = http.get('headers', {}).get('location', '').lower()
-
-        if 'login' in title or '/login' in location:
-            auth_scores = max(auth_scores, 1)
-            signals.append("login_page_detected")
+        headers = http.get('headers', {})
 
         # OAuth/SSO detection
-        if any(term in location for term in ['oauth', 'sso', 'authorize']) or \
-           any(term in title for term in ['oauth', 'sso']):
-            auth_scores = max(auth_scores, 2)
-            signals.append("oauth_sso_detected")
+        if any(term in title for term in ['login', 'oauth', 'sso']):
+            auth_bonus += 2
+            signals.append("auth_interface_detected")
 
-        # API token hints
-        headers = http.get('headers', {})
-        www_auth = headers.get('www-authenticate', '').lower()
-        if 'bearer' in www_auth or 'api_key' in str(headers).lower():
-            auth_scores = max(auth_scores, 2)
-            signals.append("api_auth_detected")
-
-        # Multi-role hints (only if GET enabled and we have content)
-        if http.get('method') == 'GET':
-            content_check = f"{title} {http.get('content_sample', '')}".lower()
-            if any(term in content_check for term in ['admin', 'role', 'permission']):
-                auth_scores = max(auth_scores, 1)
-                signals.append("multi_role_hints")
-
-    score += min(auth_scores, 4)
-
-    # Category 4: API & data interfaces (0-3)
-    api_scores = 0
-
-    # Check endpoint responses from enrichment
-    endpoint_checks = enrichment_data.get('endpoint_checks', {})
-    api_endpoints = ['/api', '/v1', '/v2', '/graphql']
-
-    responding_apis = sum(1 for ep in api_endpoints
-                         if endpoint_checks.get(ep, {}).get('status') in [200, 201, 400, 401, 403])
-
-    if responding_apis >= 2:
-        api_scores = max(api_scores, 2)
-        signals.append("multiple_api_endpoints")
-    elif responding_apis >= 1:
-        api_scores = max(api_scores, 1)
-        signals.append("api_endpoint_detected")
-
-    # JSON content type
-    for http in http_results:
-        content_type = http.get('headers', {}).get('content-type', '').lower()
+        # API indicators
+        content_type = headers.get('content-type', '').lower()
         if 'application/json' in content_type:
-            api_scores = max(api_scores, 1)
+            auth_bonus += 1
             signals.append("json_api_response")
 
-    # CORS headers
+        # Bearer token hints
+        www_auth = headers.get('www-authenticate', '').lower()
+        if 'bearer' in www_auth:
+            auth_bonus += 2
+            signals.append("bearer_auth_detected")
+
+    score += auth_bonus
+
+    # CORS and security headers
     if enrichment_data.get('cors'):
-        api_scores = max(api_scores, 1)
+        score += 1
         signals.append("cors_headers_present")
 
-    score += min(api_scores, 3)
-
-    # Category 5: Complexity/Age (0-2)
-    complexity_scores = 0
-
-    # Custom app detection (conservative heuristics)
+    # Penalties for low-signal patterns
+    penalties = 0
     for http in http_results:
         title = http.get('title', '').lower()
+
+        # Generic error pages or placeholders
+        if any(term in title for term in ['error', 'not found', 'coming soon', 'under construction', 'default page']):
+            penalties += 1
+            signals.append("generic_content_penalty")
+
+        # CDN-only responses
         server = http.get('headers', {}).get('server', '').lower()
+        if any(term in server for term in ['cloudflare-nginx', 'cloudfront']):
+            penalties += 1
+            signals.append("cdn_only_penalty")
 
-        # Avoid obvious CDN errors or static marketing
-        if not any(term in title for term in ['error', 'not found', 'coming soon', 'under construction']) and \
-           not any(term in server for term in ['cloudflare', 'nginx/static', 'apache/static']):
-            if title and len(title) > 10:  # Has meaningful title
-                complexity_scores = max(complexity_scores, 1)
-                signals.append("custom_application")
+    score = max(0, score - penalties)  # Don't go negative
 
-        # Legacy tech detection
-        if server:
-            if any(term in server for term in ['iis/6', 'iis/7', 'apache/2.2', 'php/5']):
-                complexity_scores = max(complexity_scores, 1)
-                signals.append("legacy_technology")
+    # Uniqueness boost for rare combinations
+    unique_patterns = 0
+    if len(high_value_hits) >= 3:  # Multiple high-value endpoints
+        unique_patterns += 2
+        signals.append("multiple_high_value_endpoints")
 
-    score += min(complexity_scores, 2)
+    if overrides and high_value_hits:  # Both overrides and high-value hits
+        unique_patterns += 2
+        signals.append("override_and_high_value_combo")
 
-    return score, signals
+    score += unique_patterns
+
+    # Store additional metadata
+    if overrides:
+        signals.append(f"overrides_triggered_{len(overrides)}")
+    if high_value_hits:
+        signals.append(f"high_value_hits_{len(high_value_hits)}")
+
+    return score, signals, overrides, high_value_hits
 
 
 def create_manual_review_outputs(consolidated_results: List[Dict[str, Any]],
                                 run_dir: Path, logger: logging.Logger,
-                                manual_threshold: int = 10):
+                                manual_threshold: int = 8):
     """Create manual review output files"""
     results_dir = run_dir / "results"
 
@@ -1729,28 +1763,45 @@ def create_manual_review_outputs(consolidated_results: List[Dict[str, Any]],
 
         if manual_review_hosts:
             f.write("## High-Priority Targets\n\n")
-            f.write("| Host | Score | Signals | Status | HTTPS | Title |\n")
-            f.write("|------|-------|---------|--------|-------|-------|\n")
+            f.write("| Host | Score | IP | Overrides | High-value | Status | HTTPS | Title |\n")
+            f.write("|------|-------|----|-----------|-----------|---------|---------|---------|\n")
 
             for host_data in sorted(manual_review_hosts, key=lambda x: x.get('score', 0), reverse=True):
                 host = host_data['host']
                 score = host_data.get('score', 0)
-                signals = ', '.join(host_data.get('signals', []))
+                ip_addresses = ', '.join(host_data.get('ip_addresses', [])[:2])  # Show first 2 IPs
+                if len(host_data.get('ip_addresses', [])) > 2:
+                    ip_addresses += '...'
+                overrides = ', '.join(host_data.get('overrides', []))
+                high_value_hits = ', '.join(host_data.get('high_value_hits', []))
 
                 http_results = host_data.get('http', [])
                 if http_results:
                     status = http_results[0].get('status', 'N/A')
                     https = 'Yes' if any(h.get('scheme') == 'https' for h in http_results) else 'No'
-                    title = http_results[0].get('title', 'N/A')[:50]
+                    title = http_results[0].get('title', 'N/A')[:30]
                 else:
                     status = https = title = 'N/A'
 
-                f.write(f"| {host} | {score} | {signals[:100]} | {status} | {https} | {title} |\n")
+                f.write(f"| {host} | {score} | {ip_addresses} | {overrides} | {high_value_hits} | {status} | {https} | {title} |\n")
 
             f.write("\n## Detailed Analysis\n\n")
             for host_data in manual_review_hosts:
                 f.write(f"### {host_data['host']} (Score: {host_data.get('score', 0)})\n\n")
-                f.write(f"**Signals:** {', '.join(host_data.get('signals', []))}\n\n")
+
+                # IP addresses
+                if host_data.get('ip_addresses'):
+                    f.write(f"**IP Addresses:** {', '.join(host_data.get('ip_addresses', []))}\n\n")
+
+                # Override signals
+                if host_data.get('overrides'):
+                    f.write(f"** Override Signals:** {', '.join(host_data.get('overrides', []))}\n\n")
+
+                # High-value hits
+                if host_data.get('high_value_hits'):
+                    f.write(f"** High-value Hits:** {', '.join(host_data.get('high_value_hits', []))}\n\n")
+
+                f.write(f"**All Signals:** {', '.join(host_data.get('signals', []))}\n\n")
 
                 # HTTP details
                 http_results = host_data.get('http', [])
@@ -1777,13 +1828,16 @@ def create_manual_review_outputs(consolidated_results: List[Dict[str, Any]],
     csv_file = results_dir / "host_scores.csv"
     with open(csv_file, 'w', newline='') as f:
         writer = csv.writer(f)
-        writer.writerow(['Host', 'Score', 'Signals', 'Top_Status', 'HTTPS', 'Title', 'Server', 'Manual_Review'])
+        writer.writerow(['Host', 'Score', 'Manual_Review', 'IP_Addresses', 'Overrides', 'High_Value_Hits', 'Signals', 'Top_Status', 'HTTPS', 'Title', 'Server'])
 
         for host_data in consolidated_results:
             host = host_data['host']
             score = host_data.get('score', 0)
-            signals = '; '.join(host_data.get('signals', []))
             manual_review = host_data.get('manual_review_candidate', False)
+            ip_addresses = '; '.join(host_data.get('ip_addresses', []))
+            overrides = '; '.join(host_data.get('overrides', []))
+            high_value_hits = '; '.join(host_data.get('high_value_hits', []))
+            signals = '; '.join(host_data.get('signals', []))
 
             http_results = host_data.get('http', [])
             if http_results:
@@ -1794,7 +1848,7 @@ def create_manual_review_outputs(consolidated_results: List[Dict[str, Any]],
             else:
                 top_status = https = title = server = ''
 
-            writer.writerow([host, score, signals, top_status, https, title, server, manual_review])
+            writer.writerow([host, score, manual_review, ip_addresses, overrides, high_value_hits, signals, top_status, https, title, server])
 
     log_info(f"Manual review outputs created: {len(manual_review_hosts)} candidates", logger)
     log_info(f"- JSON targets: {manual_review_file}", logger)
@@ -1808,7 +1862,7 @@ def consolidate_results(targets: List[str], all_hosts: Set[str], http_results: L
                        rate_limiter: RateLimiter, logger: logging.Logger,
                        dns_results: Dict[str, Dict[str, Any]] = None,
                        enrichment_results: Dict[str, Dict[str, Any]] = None,
-                       enable_scoring: bool = True, manual_threshold: int = 10) -> List[Dict[str, Any]]:
+                       enable_scoring: bool = True, manual_threshold: int = 8) -> List[Dict[str, Any]]:
     """Consolidate all results into structured format with scoring"""
     host_data = {}
 
@@ -1825,7 +1879,10 @@ def consolidate_results(targets: List[str], all_hosts: Set[str], http_results: L
             'enrichment': {},
             'score': 0,
             'signals': [],
-            'manual_review_candidate': False
+            'manual_review_candidate': False,
+            'ip_addresses': [],
+            'overrides': [],
+            'high_value_hits': []
         }
 
     # Map hosts to their input domains
@@ -1835,7 +1892,7 @@ def consolidate_results(targets: List[str], all_hosts: Set[str], http_results: L
                 host_data[host]['input_domain'] = target
                 break
 
-    # Add DNS information
+    # Add DNS information and IP addresses
     dns_results = dns_results or {}
     for host in all_hosts:
         if host in dns_results:
@@ -1844,6 +1901,14 @@ def consolidate_results(targets: List[str], all_hosts: Set[str], http_results: L
         elif host_data[host]['in_scope']:
             # Fallback to dnspython for any missed hosts
             host_data[host]['dns'] = resolve_dns_records(host, rate_limiter, logger)
+
+        # Extract IP addresses from DNS records
+        dns_data = host_data[host]['dns']
+        ip_addresses = []
+        if isinstance(dns_data, dict):
+            ip_addresses.extend(dns_data.get('a_records', []))
+            ip_addresses.extend(dns_data.get('aaaa_records', []))
+        host_data[host]['ip_addresses'] = ip_addresses
 
     # Add HTTP results
     for result in http_results:
@@ -1865,10 +1930,12 @@ def consolidate_results(targets: List[str], all_hosts: Set[str], http_results: L
 
         # Calculate score for hosts with HTTP results
         if enable_scoring and host_data[host]['http']:
-            score, signals = calculate_host_score(host_data[host], enrichment_results.get(host, {}))
+            score, signals, overrides, high_value_hits = calculate_host_score(host_data[host], enrichment_results.get(host, {}))
             host_data[host]['score'] = score
             host_data[host]['signals'] = signals
-            host_data[host]['manual_review_candidate'] = score >= manual_threshold
+            host_data[host]['overrides'] = overrides
+            host_data[host]['high_value_hits'] = high_value_hits
+            host_data[host]['manual_review_candidate'] = score >= manual_threshold or len(overrides) > 0
             scored_hosts += 1
 
     if enable_scoring and scored_hosts > 0:
@@ -2016,6 +2083,8 @@ class ReconUIHandler(SimpleHTTPRequestHandler):
         .score-high {{ font-weight: bold; color: #dc3545; }}
         .score-medium {{ font-weight: bold; color: #fd7e14; }}
         .score-low {{ color: #28a745; }}
+        .overrides {{ background-color: #f8d7da; font-weight: bold; }}
+        .high-value {{ background-color: #cce7ff; }}
     </style>
 </head>
 <body>
@@ -2040,6 +2109,11 @@ class ReconUIHandler(SimpleHTTPRequestHandler):
             <option value="dnsx">DNS Resolved</option>
             <option value="wordlist">Wordlist</option>
         </select>
+        <select id="override-filter">
+            <option value="all">All Overrides</option>
+            <option value="overrides-only">Override Signals Only</option>
+            <option value="high-value-only">High-value Hits Only</option>
+        </select>
     </div>
 
     <table id="results-table">
@@ -2047,9 +2121,13 @@ class ReconUIHandler(SimpleHTTPRequestHandler):
             <tr>
                 <th>Host</th>
                 <th>Score</th>
+                <th>Manual?</th>
+                <th>IP</th>
                 <th>Status</th>
                 <th>Sources</th>
                 <th>HTTP Services</th>
+                <th>Overrides</th>
+                <th>High-value hits</th>
                 <th>Signals</th>
                 <th>Notes</th>
             </tr>
@@ -2094,23 +2172,34 @@ class ReconUIHandler(SimpleHTTPRequestHandler):
                 if (result.http && result.http.length > 0) row.classList.add('live');
                 if (result.manual_review_candidate) row.classList.add('manual-review');
                 if (!result.in_scope) row.classList.add('out-of-scope');
+                if (result.overrides && result.overrides.length > 0) row.classList.add('overrides');
+                if (result.high_value_hits && result.high_value_hits.length > 0) row.classList.add('high-value');
 
-                const scoreClass = result.score >= 10 ? 'score-high' :
-                                 result.score >= 5 ? 'score-medium' : 'score-low';
+                const scoreClass = result.score >= 8 ? 'score-high' :
+                                 result.score >= 4 ? 'score-medium' : 'score-low';
 
                 const httpServices = result.http ? result.http.map(h =>
                     `${{h.scheme}}://${{result.host}}:${{h.port}} (${{h.status}})`
                 ).join('<br>') : 'None';
 
+                const ipAddresses = result.ip_addresses ? result.ip_addresses.slice(0, 3).join(', ') +
+                    (result.ip_addresses.length > 3 ? '...' : '') : 'None';
+                const manualReview = result.manual_review_candidate ? '✓' : '';
+                const overrides = result.overrides ? result.overrides.join(', ') : '';
+                const highValueHits = result.high_value_hits ? result.high_value_hits.join(', ') : '';
                 const signals = result.signals ? result.signals.join(', ') : '';
                 const notes = result.notes ? result.notes.length : 0;
 
                 row.innerHTML = `
                     <td>${{result.host}}</td>
                     <td class="${{scoreClass}}">${{result.score}}</td>
+                    <td>${{manualReview}}</td>
+                    <td title="${{result.ip_addresses ? result.ip_addresses.join(', ') : ''}}">${{ipAddresses}}</td>
                     <td>${{result.in_scope ? (result.http.length > 0 ? 'Live' : 'Down') : 'Out-of-scope'}}</td>
                     <td>${{result.source.join(', ')}}</td>
                     <td>${{httpServices}}</td>
+                    <td>${{overrides}}</td>
+                    <td>${{highValueHits}}</td>
                     <td>${{signals}}</td>
                     <td>${{notes}} notes</td>
                 `;
@@ -2122,6 +2211,7 @@ class ReconUIHandler(SimpleHTTPRequestHandler):
             const searchTerm = document.getElementById('search').value.toLowerCase();
             const statusFilter = document.getElementById('status-filter').value;
             const sourceFilter = document.getElementById('source-filter').value;
+            const overrideFilter = document.getElementById('override-filter').value;
 
             let filtered = allResults.filter(result => {{
                 const matchesSearch = result.host.toLowerCase().includes(searchTerm);
@@ -2134,7 +2224,11 @@ class ReconUIHandler(SimpleHTTPRequestHandler):
                 let matchesSource = true;
                 if (sourceFilter !== 'all') matchesSource = result.source.includes(sourceFilter);
 
-                return matchesSearch && matchesStatus && matchesSource;
+                let matchesOverride = true;
+                if (overrideFilter === 'overrides-only') matchesOverride = result.overrides && result.overrides.length > 0;
+                else if (overrideFilter === 'high-value-only') matchesOverride = result.high_value_hits && result.high_value_hits.length > 0;
+
+                return matchesSearch && matchesStatus && matchesSource && matchesOverride;
             }});
 
             renderTable(filtered);
@@ -2143,6 +2237,7 @@ class ReconUIHandler(SimpleHTTPRequestHandler):
         document.getElementById('search').addEventListener('input', filterResults);
         document.getElementById('status-filter').addEventListener('change', filterResults);
         document.getElementById('source-filter').addEventListener('change', filterResults);
+        document.getElementById('override-filter').addEventListener('change', filterResults);
 
         loadResults();
     </script>
@@ -2261,8 +2356,8 @@ Examples:
                        help='Enable security scoring (default: true)')
     parser.add_argument('--disable-scoring', action='store_false', dest='enable_scoring',
                        help='Disable security scoring')
-    parser.add_argument('--manual-threshold', type=int, default=10,
-                       help='Minimum score for manual review candidacy (default: 10)')
+    parser.add_argument('--manual-threshold', type=int, default=8,
+                       help='Minimum score for manual review candidacy (default: 8)')
     parser.add_argument('--max-js-per-host', type=int, default=10,
                        help='Maximum JavaScript files to analyze per host (default: 10)')
     parser.add_argument('--max-bytes', type=int, default=1048576,
