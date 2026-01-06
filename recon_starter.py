@@ -388,17 +388,52 @@ def run_subfinder(domain: str, raw_dir: Path, rate_limiter: RateLimiter,
 
     try:
         rate_limiter.wait()
-        result = subprocess.run([
+
+        # Use Popen for streaming output with progress reporting
+        process = subprocess.Popen([
             "subfinder", "-d", domain, "-silent", "-o", str(cache_file)
-        ], capture_output=True, text=True, timeout=120)
+        ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
-        if result.returncode != 0:
-            if result.stderr:
-                log_warning(f"subfinder completed with warnings for {domain}: {result.stderr.strip()}", logger)
+        # Monitor progress by checking output file periodically
+        import threading
+        import time
+
+        def monitor_progress():
+            last_count = 0
+            while process.poll() is None:
+                time.sleep(2)  # Check every 2 seconds
+                if cache_file.exists():
+                    try:
+                        with open(cache_file, 'r') as f:
+                            current_count = sum(1 for line in f if line.strip())
+
+                        # Report progress every 10 domains found
+                        if current_count >= last_count + 10:
+                            log_info(f"subfinder progress for {domain}: {current_count} domains found", logger)
+                            last_count = (current_count // 10) * 10  # Round down to nearest 10
+                    except (IOError, OSError):
+                        pass  # File might be temporarily locked
+
+        # Start progress monitoring in background
+        monitor_thread = threading.Thread(target=monitor_progress, daemon=True)
+        monitor_thread.start()
+
+        # Wait for completion with timeout
+        try:
+            stdout, stderr = process.communicate(timeout=300)
+            returncode = process.returncode
+        except subprocess.TimeoutExpired:
+            process.kill()
+            stdout, stderr = process.communicate()
+            raise subprocess.TimeoutExpired("subfinder", 300)
+
+        if returncode != 0:
+            if stderr:
+                log_warning(f"subfinder completed with warnings for {domain}: {stderr.strip()}", logger)
             else:
-                log_warning(f"subfinder exited with code {result.returncode} for {domain}", logger)
+                log_warning(f"subfinder exited with code {returncode} for {domain}", logger)
 
-        # Read results from output file
+        # Read final results from output file
         subdomains = set()
         if cache_file.exists():
             with open(cache_file, 'r') as f:
@@ -412,7 +447,7 @@ def run_subfinder(domain: str, raw_dir: Path, rate_limiter: RateLimiter,
         return subdomains
 
     except subprocess.TimeoutExpired:
-        log_error(f"subfinder timeout for {domain} (120s limit)", logger)
+        log_error(f"subfinder timeout for {domain} (300s limit)", logger)
         return set()
     except Exception as e:
         log_error(f"subfinder error for {domain}: {e}", logger)
@@ -585,8 +620,7 @@ def run_dnsx_resolve(hosts: Set[str], raw_dir: Path, rate_limiter: RateLimiter,
             '-l', str(hosts_file),
             '-json',
             '-silent',
-            '-a',      # Query A records
-            '-aaaa',   # Query AAAA records
+            '-recon',  # Query all DNS record types (a,aaaa,cname,ns,txt,srv,ptr,mx,soa,axfr,caa)
             '-retry', '2',
             '-timeout', f'{timeout}s'
         ]
@@ -599,60 +633,164 @@ def run_dnsx_resolve(hosts: Set[str], raw_dir: Path, rate_limiter: RateLimiter,
 
         log_info(f"Running: {' '.join(cmd[:6])} ... (truncated)", logger)
 
-        # Run dnsx with timeout
+        # Run dnsx with streaming output and progress reporting
         start_time = time.time()
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True,
-                                  timeout=max(60, len(hosts) * 2))
+            process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+            # Monitor progress by counting resolved hosts
+            import threading
+            resolved_count = 0
+            total_hosts = len(hosts)
+
+            def monitor_dnsx_progress():
+                nonlocal resolved_count
+                partial_output = ""
+
+                while process.poll() is None:
+                    try:
+                        # Read available output
+                        if process.stdout:
+                            chunk = process.stdout.read(1024)
+                            if chunk:
+                                partial_output += chunk
+
+                                # Count complete JSON lines (hosts resolved)
+                                lines = partial_output.split('\n')
+                                partial_output = lines[-1]  # Keep incomplete line for next iteration
+
+                                for line in lines[:-1]:
+                                    if line.strip() and line.startswith('{'):
+                                        try:
+                                            dns_data = json.loads(line)
+                                            # Count any DNS record type as resolved
+                                            has_records = any([
+                                                dns_data.get('a'), dns_data.get('aaaa'), dns_data.get('cname'),
+                                                dns_data.get('mx'), dns_data.get('ns'), dns_data.get('txt'),
+                                                dns_data.get('srv'), dns_data.get('soa'), dns_data.get('caa'), dns_data.get('ptr')
+                                            ])
+                                            if dns_data.get('host') and has_records:
+                                                resolved_count += 1
+                                                # Report progress every 20 resolved hosts
+                                                if resolved_count % 20 == 0:
+                                                    log_info(f"dnsx progress: {resolved_count}/{total_hosts} hosts with DNS records found", logger)
+                                        except json.JSONDecodeError:
+                                            pass
+                    except Exception:
+                        pass
+                    time.sleep(1)
+
+            # Start progress monitoring
+            monitor_thread = threading.Thread(target=monitor_dnsx_progress, daemon=True)
+            monitor_thread.start()
+
+            # Wait for completion
+            stdout, stderr = process.communicate(timeout=max(60, len(hosts) * 2))
+            returncode = process.returncode
 
             duration = time.time() - start_time
 
-            if result.returncode != 0:
-                if result.stderr:
-                    log_warning(f"dnsx completed with warnings: {result.stderr.strip()}", logger)
+            if returncode != 0:
+                if stderr:
+                    log_warning(f"dnsx completed with warnings: {stderr.strip()}", logger)
                 else:
-                    log_warning(f"dnsx exited with code {result.returncode}", logger)
+                    log_warning(f"dnsx exited with code {returncode}", logger)
 
             # Parse JSON results
             dns_results = {}
-            if result.stdout:
-                for line in result.stdout.strip().split('\n'):
+            if stdout:
+                for line in stdout.strip().split('\n'):
                     if line.strip():
                         try:
                             dns_data = json.loads(line)
                             host = dns_data.get('host', '').lower()
 
                             if host and host in hosts:
-                                # Check if host has any A or AAAA records
+                                # Extract all DNS record types from recon scan
                                 a_records = dns_data.get('a', [])
                                 aaaa_records = dns_data.get('aaaa', [])
                                 ip_count = len(a_records) + len(aaaa_records)
 
-                                # Only include hosts with actual IP addresses
-                                if ip_count > 0:
-                                    dns_results[host] = {
-                                        'a_records': a_records,
-                                        'aaaa_records': aaaa_records,
-                                        'resolver': dns_data.get('resolver', ''),
-                                        'timestamp': datetime.now(timezone.utc).isoformat()
-                                    }
+                                # Build comprehensive DNS result with all record types
+                                dns_result = {
+                                    'a_records': a_records,
+                                    'aaaa_records': aaaa_records,
+                                    'cname_records': dns_data.get('cname', []),
+                                    'mx_records': dns_data.get('mx', []),
+                                    'ns_records': dns_data.get('ns', []),
+                                    'txt_records': dns_data.get('txt', []),
+                                    'srv_records': dns_data.get('srv', []),
+                                    'soa_records': dns_data.get('soa', []),
+                                    'caa_records': dns_data.get('caa', []),
+                                    'ptr_records': dns_data.get('ptr', []),
+                                    'resolver': dns_data.get('resolver', ''),
+                                    'timestamp': datetime.now(timezone.utc).isoformat()
+                                }
+
+                                # Include host if it has any DNS records (not just A/AAAA)
+                                has_any_records = any([
+                                    dns_result['a_records'],
+                                    dns_result['aaaa_records'],
+                                    dns_result['cname_records'],
+                                    dns_result['mx_records'],
+                                    dns_result['ns_records'],
+                                    dns_result['txt_records'],
+                                    dns_result['srv_records'],
+                                    dns_result['soa_records'],
+                                    dns_result['caa_records'],
+                                    dns_result['ptr_records']
+                                ])
+
+                                if has_any_records:
+                                    dns_results[host] = dns_result
 
                                     # Update host sources
                                     host_sources[host].add("dnsx")
+
+                                    # Count different record types for notes
+                                    record_counts = {
+                                        'a': len(dns_result['a_records']),
+                                        'aaaa': len(dns_result['aaaa_records']),
+                                        'cname': len(dns_result['cname_records']),
+                                        'mx': len(dns_result['mx_records']),
+                                        'ns': len(dns_result['ns_records']),
+                                        'txt': len(dns_result['txt_records']),
+                                        'srv': len(dns_result['srv_records']),
+                                        'soa': len(dns_result['soa_records']),
+                                        'caa': len(dns_result['caa_records']),
+                                        'ptr': len(dns_result['ptr_records'])
+                                    }
 
                                     # Add note about successful resolution
                                     note = {
                                         "type": "dns_resolved",
                                         "ip_count": ip_count,
-                                        "a_records": len(a_records),
-                                        "aaaa_records": len(aaaa_records)
+                                        "record_counts": record_counts,
+                                        "total_records": sum(record_counts.values())
                                     }
                                     host_notes[host].append(note)
+
+                                    # Special notes for interesting records
+                                    if dns_result['txt_records']:
+                                        txt_note = {
+                                            "type": "txt_records_found",
+                                            "count": len(dns_result['txt_records']),
+                                            "sample": dns_result['txt_records'][:3]  # First 3 TXT records
+                                        }
+                                        host_notes[host].append(txt_note)
+
+                                    if dns_result['mx_records']:
+                                        mx_note = {
+                                            "type": "mx_records_found",
+                                            "count": len(dns_result['mx_records']),
+                                            "mail_servers": dns_result['mx_records']
+                                        }
+                                        host_notes[host].append(mx_note)
                                 else:
-                                    # Add note about failed resolution (no IP records)
+                                    # Add note about no DNS records found
                                     note = {
                                         "type": "dns_no_records",
-                                        "message": "Host resolved but has no A or AAAA records",
+                                        "message": "Host has no DNS records",
                                         "timestamp": datetime.now(timezone.utc).isoformat()
                                     }
                                     host_notes[host].append(note)
@@ -711,27 +849,41 @@ def resolve_dns_records(host: str, rate_limiter: RateLimiter, logger: logging.Lo
     import dns.exception
 
     records = {
-        'A': [],
-        'AAAA': [],
-        'CNAME': [],
-        'MX': [],
-        'NS': [],
-        'TXT': []
+        'a_records': [],
+        'aaaa_records': [],
+        'cname_records': [],
+        'mx_records': [],
+        'ns_records': [],
+        'txt_records': []
     }
 
-    for record_type in records.keys():
+    # Map new format to DNS query types
+    dns_type_mapping = {
+        'a_records': 'A',
+        'aaaa_records': 'AAAA',
+        'cname_records': 'CNAME',
+        'mx_records': 'MX',
+        'ns_records': 'NS',
+        'txt_records': 'TXT'
+    }
+
+    for field_name, dns_type in dns_type_mapping.items():
         try:
             rate_limiter.wait()
-            answers = dns.resolver.resolve(host, record_type)
+            answers = dns.resolver.resolve(host, dns_type)
             for answer in answers:
-                if record_type == 'MX':
-                    records[record_type].append(f"{answer.preference} {answer.exchange}")
+                if dns_type == 'MX':
+                    # For MX, just store the exchange server name (to match dnsx format)
+                    records[field_name].append(str(answer.exchange).rstrip('.'))
+                elif dns_type in ['CNAME', 'NS']:
+                    # Remove trailing dot to match dnsx format
+                    records[field_name].append(str(answer).rstrip('.'))
                 else:
-                    records[record_type].append(str(answer))
+                    records[field_name].append(str(answer))
         except (dns.exception.DNSException, dns.resolver.NXDOMAIN, dns.resolver.NoAnswer):
             pass  # Record type not found, continue
         except Exception as e:
-            logger.debug(f"DNS resolution error for {host} {record_type}: {e}")
+            logger.debug(f"DNS resolution error for {host} {dns_type}: {e}")
 
     return records
 
@@ -829,6 +981,54 @@ def parse_cached_httpx_results(cache_file: Path, logger: logging.Logger,
     return results
 
 
+def extract_httpx_host(probe_result: Dict[str, Any], logger: logging.Logger) -> str:
+    """
+    Robustly extract hostname from httpx JSON result.
+    Returns lowercase hostname or empty string if extraction fails.
+    """
+    # Method 1: Use 'host' field if available (most reliable)
+    if 'host' in probe_result:
+        host = str(probe_result['host']).strip().lower()
+        if host:
+            return host
+
+    # Method 2: Try 'input' field - may be hostname or URL
+    if 'input' in probe_result:
+        input_val = str(probe_result['input']).strip()
+        if input_val:
+            # If input contains ://, it's a URL - parse it
+            if '://' in input_val:
+                try:
+                    parsed = urllib.parse.urlparse(input_val)
+                    if parsed.netloc:
+                        # Remove port if present (host:port -> host)
+                        host = parsed.netloc.split(':')[0].lower()
+                        if host:
+                            return host
+                except Exception:
+                    pass
+            else:
+                # Input is likely just hostname[:port] - extract hostname part
+                host = input_val.split(':')[0].lower()
+                if host and '.' in host:  # Basic hostname validation
+                    return host
+
+    # Method 3: Try 'url' field as fallback
+    if 'url' in probe_result:
+        try:
+            parsed = urllib.parse.urlparse(str(probe_result['url']))
+            if parsed.netloc:
+                host = parsed.netloc.split(':')[0].lower()
+                if host:
+                    return host
+        except Exception:
+            pass
+
+    # If all methods fail, log debug message and return empty
+    logger.debug(f"Failed to extract host from httpx result: {probe_result.keys()}")
+    return ""
+
+
 def run_httpx_probe(hosts: Set[str], raw_dir: Path, in_scope_patterns: List[str],
                    out_of_scope_patterns: List[str], ports: List[int],
                    enable_get: bool, rate: float, concurrency: int, timeout: int,
@@ -873,20 +1073,35 @@ def run_httpx_probe(hosts: Set[str], raw_dir: Path, in_scope_patterns: List[str]
 
     # Process results and add host information
     processed_results = []
+    total_lines = len(all_results)
+    parsed_json_lines = 0
+    valid_host_records = 0
+    skipped_records = 0
+
     for probe_result in all_results:
         try:
-            # Extract host from URL - httpx may use 'url', 'input', or 'host'
-            url = probe_result.get('url', probe_result.get('input', ''))
-            if not url:
+            parsed_json_lines += 1
+
+            # Extract hostname using robust method
+            original_host = extract_httpx_host(probe_result, logger)
+            if not original_host:
+                skipped_records += 1
+                logger.debug(f"Skipping record with no extractable host: {list(probe_result.keys())[:5]}")
                 continue
 
-            parsed_url = urllib.parse.urlparse(url)
-            original_host = parsed_url.netloc.split(':')[0]
+            valid_host_records += 1
 
-            # Handle final URL (redirects) - httpx may use 'final-url' or 'final_url'
-            final_url = probe_result.get('final-url', probe_result.get('final_url', url))
-            parsed_final = urllib.parse.urlparse(final_url)
-            final_host = parsed_final.netloc.split(':')[0]
+            # Handle final URL (redirects)
+            final_url = probe_result.get('url', '')
+            if final_url:
+                try:
+                    parsed_final = urllib.parse.urlparse(final_url)
+                    final_host = parsed_final.netloc.split(':')[0] if parsed_final.netloc else original_host
+                except Exception:
+                    final_host = original_host
+            else:
+                final_host = original_host
+                final_url = f"http://{original_host}"  # Fallback URL construction
 
             # Check for redirects and scope violations
             redirect_blocked = False
@@ -906,11 +1121,21 @@ def run_httpx_probe(hosts: Set[str], raw_dir: Path, in_scope_patterns: List[str]
                         final_url = url
                         final_host = original_host
 
-            # Extract status code - httpx may use different field names
-            status = probe_result.get('status-code', probe_result.get('status_code', probe_result.get('status', 0)))
+            # Extract status code - httpx JSON mode uses 'status_code'
+            status = probe_result.get('status_code', 0)
 
             # Extract port
             port = parsed_final.port or (443 if parsed_final.scheme == 'https' else 80)
+
+            # Extract headers (version-safe)
+            headers = {}
+            # Try multiple possible header field names for version compatibility
+            for header_field in ['header', 'headers', 'response_headers']:
+                if header_field in probe_result:
+                    raw_headers = probe_result[header_field]
+                    if isinstance(raw_headers, dict):
+                        headers = raw_headers
+                        break
 
             http_result = {
                 'scheme': parsed_final.scheme or parsed_url.scheme,
@@ -918,16 +1143,19 @@ def run_httpx_probe(hosts: Set[str], raw_dir: Path, in_scope_patterns: List[str]
                 'status': status,
                 'final_url': final_url,
                 'method': probe_result.get('method', 'HEAD'),
-                'headers': {},
-                'content_length': probe_result.get('content-length', probe_result.get('content_length')),
+                'headers': headers,
+                'content_length': probe_result.get('content_length', 0),
+                'title': probe_result.get('title', ''),
+                'webserver': probe_result.get('webserver', ''),
+                'tech': probe_result.get('tech', []),
             }
 
             # Add redirect info if blocked
             if redirect_blocked:
-                http_result['redirect_blocked_to'] = probe_result.get('final-url', probe_result.get('final_url', ''))
+                http_result['redirect_blocked_to'] = probe_result.get('location', '')
 
-            # Extract server header - httpx may use 'webserver' or 'web-server'
-            server = probe_result.get('webserver', probe_result.get('web-server', probe_result.get('server')))
+            # Extract server header - httpx JSON mode uses 'webserver'
+            server = probe_result.get('webserver', '')
             if server:
                 http_result['headers']['server'] = server
 
@@ -947,7 +1175,11 @@ def run_httpx_probe(hosts: Set[str], raw_dir: Path, in_scope_patterns: List[str]
             })
 
         except Exception as e:
-            logger.debug(f"HTTP probe error for {url}: {e}")
+            skipped_records += 1
+            logger.debug(f"HTTP probe error: {e}")
+
+    # Log parsing diagnostics
+    log_info(f"Parsing results: {total_lines} total, {parsed_json_lines} JSON lines, {valid_host_records} valid hosts, {skipped_records} skipped", logger)
 
     return processed_results
 
@@ -986,9 +1218,12 @@ def run_httpx_batch(hosts: List[str], raw_dir: Path, ports: List[int],
         if enable_get:
             cmd.extend(['-method', 'GET'])
 
-        # Add rate limiting
+        # Add rate limiting - convert requests/second to requests/minute for httpx
         if rate > 0:
-            cmd.extend(['-rate-limit', str(int(rate))])
+            # httpx -rate-limit expects requests per minute, our rate is requests per second
+            # Convert: 0.2 rps = 12 rpm, minimum 1 rpm to avoid zero rate-limit
+            rpm = max(1, int(rate * 60))
+            cmd.extend(['-rate-limit', str(rpm)])
 
         # Add redirect handling
         if follow_redirects:
@@ -997,38 +1232,47 @@ def run_httpx_batch(hosts: List[str], raw_dir: Path, ports: List[int],
         # User agent
         cmd.extend(['-user-agent', user_agent])
 
-        # Additional useful flags
+        # Additional useful flags for enrichment
         cmd.extend(['-title', '-tech-detect', '-web-server'])
 
         log_info(f"Running httpx for {len(hosts)} hosts", logger)
 
-        # Run httpx
+        # Run httpx with timeout
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=max(300, len(hosts) * 3))
 
-        # Handle httpx results
+        # Enhanced error reporting
+        if result.returncode != 0:
+            cmd_summary = ' '.join(cmd[:8]) + ('...' if len(cmd) > 8 else '')
+            stderr_preview = result.stderr.strip()[:500] if result.stderr else "No stderr"
+            log_warning(f"httpx exited with code {result.returncode}", logger)
+            log_warning(f"Command: {cmd_summary}", logger)
+            log_warning(f"Stderr: {stderr_preview}", logger)
+
+        # Handle httpx results with enhanced parsing
         results = []
+        total_lines_read = 0
+        valid_json_lines = 0
+
         if output_file.exists():
             try:
                 with open(output_file, 'r') as f:
                     for line in f:
+                        total_lines_read += 1
                         line = line.strip()
                         if line:
                             try:
                                 probe_result = json.loads(line)
+                                valid_json_lines += 1
                                 results.append(probe_result)
-                            except json.JSONDecodeError:
+                            except json.JSONDecodeError as e:
+                                logger.debug(f"Failed to parse JSON line: {line[:100]}... Error: {e}")
                                 continue
             except Exception as e:
                 logger.debug(f"Error reading httpx output: {e}")
 
-        if result.returncode != 0:
-            # Enhanced error handling
-            if result.stderr.strip():
-                log_warning(f"httpx completed with issues: {result.stderr.strip()}", logger)
-            else:
-                log_warning(f"httpx exited with code {result.returncode} (command: {' '.join(cmd[:3])} ...)", logger)
+        # Log detailed parsing results
+        log_info(f"httpx batch complete: {total_lines_read} lines read, {valid_json_lines} valid JSON, {len(results)} results", logger)
 
-        log_info(f"httpx found {len(results)} responding services", logger)
         return results
 
     except subprocess.TimeoutExpired:
@@ -1322,7 +1566,6 @@ def run_enrichment_checks(live_hosts: List[Dict[str, Any]], raw_dir: Path,
         log_info(f"Enrichment [{i}/{len(live_hosts)}]: Analyzing {host}", logger)
 
         enrichment = {
-            'security_headers': {},
             'cookies': {},
             'cors': {},
             'well_known': {},
@@ -1338,7 +1581,6 @@ def run_enrichment_checks(live_hosts: List[Dict[str, Any]], raw_dir: Path,
 
             # Analyze existing headers
             headers = http_result.get('headers', {})
-            enrichment['security_headers'] = analyze_security_headers(headers)
             enrichment['cors'] = analyze_cors_headers(headers)
 
             # Check for cookies in Set-Cookie headers
@@ -1400,49 +1642,27 @@ def run_enrichment_checks(live_hosts: List[Dict[str, Any]], raw_dir: Path,
         if enable_get:
             log_info(f"Enrichment [{i}/{len(live_hosts)}]: Discovering JS endpoints for {host}", logger)
             try:
-                js_endpoints = discover_js_endpoints(
+                js_discovery_result = discover_js_endpoints(
                     base_url, session, rate_limiter, logger,
                     max_js_per_host, max_bytes, timeout
                 )
-                enrichment['js_endpoints'] = js_endpoints
-                if js_endpoints:
-                    log_info(f"Enrichment [{i}/{len(live_hosts)}]: Found {len(js_endpoints)} JS endpoints for {host}", logger)
+                enrichment['js_endpoints'] = js_discovery_result['endpoints']
+                enrichment['js_files'] = js_discovery_result['js_files']
+                if js_discovery_result['endpoints']:
+                    log_info(f"Enrichment [{i}/{len(live_hosts)}]: Found {len(js_discovery_result['endpoints'])} JS endpoints from {len(js_discovery_result['js_files'])} JS files for {host}", logger)
             except Exception as e:
                 logger.debug(f"JS discovery error for {host}: {e}")
 
         # Count findings for progress reporting
         endpoint_count = len([ep for ep in enrichment['endpoint_checks'].values() if ep.get('status', 0) < 400])
-        security_headers_count = len([h for h in enrichment['security_headers'].values() if h.get('present')])
 
-        log_info(f"Enrichment [{i}/{len(live_hosts)}]: Completed {host} - {endpoint_count} endpoints, {security_headers_count} security headers", logger)
+        log_info(f"Enrichment [{i}/{len(live_hosts)}]: Completed {host} - {endpoint_count} endpoints", logger)
 
         enrichment_results[host] = enrichment
 
     log_info(f"Enrichment phase completed: {len(enrichment_results)}/{len(live_hosts)} hosts successfully analyzed", logger)
     return enrichment_results
 
-
-def analyze_security_headers(headers: Dict[str, str]) -> Dict[str, Any]:
-    """Analyze security headers"""
-    security_headers = {}
-
-    header_checks = {
-        'content-security-policy': 'csp',
-        'strict-transport-security': 'hsts',
-        'x-frame-options': 'xfo',
-        'x-content-type-options': 'xcto',
-        'referrer-policy': 'referrer_policy',
-        'x-xss-protection': 'xss_protection'
-    }
-
-    for header_name, key in header_checks.items():
-        value = headers.get(header_name, headers.get(header_name.title(), ''))
-        security_headers[key] = {
-            'present': bool(value),
-            'value': value if value else None
-        }
-
-    return security_headers
 
 
 def analyze_cors_headers(headers: Dict[str, str]) -> Dict[str, Any]:
@@ -1503,9 +1723,10 @@ def analyze_cookies(set_cookie_header: str) -> Dict[str, Any]:
 
 def discover_js_endpoints(base_url: str, session: requests.Session,
                          rate_limiter: RateLimiter, logger: logging.Logger,
-                         max_js_files: int, max_bytes: int, timeout: int) -> List[str]:
+                         max_js_files: int, max_bytes: int, timeout: int) -> Dict[str, Any]:
     """Safely discover JavaScript endpoints from main page"""
     js_endpoints = []
+    js_files_info = []
 
     try:
         # Get main page
@@ -1513,7 +1734,7 @@ def discover_js_endpoints(base_url: str, session: requests.Session,
         response = session.get(base_url, timeout=timeout, stream=True)
 
         if response.status_code != 200:
-            return js_endpoints
+            return {"endpoints": js_endpoints, "js_files": js_files_info}
 
         # Read limited content
         content = response.content[:max_bytes]
@@ -1538,10 +1759,21 @@ def discover_js_endpoints(base_url: str, session: requests.Session,
                 else:
                     js_url = f"{base_url.rstrip('/')}/{js_path}"
 
+                # Extract JS file name for display
+                js_filename = js_path.split('/')[-1] if '/' in js_path else js_path
+                js_file_info = {
+                    "name": js_filename,
+                    "path": js_path,
+                    "url": js_url,
+                    "endpoints_found": 0,
+                    "status": "unknown"
+                }
+
                 rate_limiter.wait()
                 js_response = session.get(js_url, timeout=timeout, stream=True)
 
                 if js_response.status_code == 200:
+                    js_file_info["status"] = "accessible"
                     js_content = js_response.content[:max_bytes].decode('utf-8', errors='ignore')
 
                     # Extract potential API endpoints
@@ -1551,13 +1783,25 @@ def discover_js_endpoints(base_url: str, session: requests.Session,
                         r'["\']([^"\']*/?graphql[^"\']*)["\']'
                     ]
 
+                    endpoints_from_this_file = []
                     for pattern in api_patterns:
                         endpoints = re.findall(pattern, js_content, re.IGNORECASE)
                         for endpoint in endpoints:
                             if endpoint not in js_endpoints:
                                 js_endpoints.append(endpoint)
+                                endpoints_from_this_file.append(endpoint)
 
+                    js_file_info["endpoints_found"] = len(endpoints_from_this_file)
+                    js_file_info["endpoints"] = endpoints_from_this_file[:5]  # Store first 5 endpoints
+                else:
+                    js_file_info["status"] = f"error_{js_response.status_code}"
+
+                js_files_info.append(js_file_info)
                 js_files_found += 1
+
+                # Log progress for JS file processing
+                if js_file_info["endpoints_found"] > 0:
+                    log_info(f"JS file {js_filename}: found {js_file_info['endpoints_found']} endpoints", logger)
 
             except Exception as e:
                 logger.debug(f"JS file processing error for {js_url}: {e}")
@@ -1566,7 +1810,10 @@ def discover_js_endpoints(base_url: str, session: requests.Session,
     except Exception as e:
         logger.debug(f"JS discovery error for {base_url}: {e}")
 
-    return js_endpoints[:10]  # Limit results
+    return {
+        "endpoints": js_endpoints[:10],  # Limit results
+        "js_files": js_files_info
+    }
 
 
 def calculate_host_score(host_data: Dict[str, Any], enrichment_data: Dict[str, Any]) -> Tuple[int, List[str]]:
@@ -1617,15 +1864,16 @@ def calculate_host_score(host_data: Dict[str, Any], enrichment_data: Dict[str, A
         'api_discovery': ['/graphql', '/swagger.json', '/openapi.json']
     }
 
-    # Base score: 1 point per meaningful response (not 404s)
+    # Base score: 1 point per meaningful response (not 404s or redirects)
     responding_endpoints = 0
     for path, result in endpoint_checks.items():
         status = result.get('status', 0)
-        # Only count meaningful responses: success (2xx, 3xx) or security-relevant (401, 403, 5xx)
-        if status in range(200, 400) or status in [401, 403] or status in range(500, 600):
+        # Only count true positives: success (2xx) or security-relevant (401, 403, 5xx)
+        # Exclude redirects (3xx) as they are inconclusive for security endpoints
+        if status in range(200, 300) or status in [401, 403] or status in range(500, 600):
             responding_endpoints += 1
 
-            # High-value path bonuses (only for meaningful responses)
+            # High-value path bonuses (only for true positive responses)
             if path in high_value_paths:
                 bonus = high_value_paths[path]
                 score += bonus
@@ -1652,10 +1900,14 @@ def calculate_host_score(host_data: Dict[str, Any], enrichment_data: Dict[str, A
 
         elif indicator_type in ['admin_access', 'config_exposure', 'api_discovery']:
             for path in criteria:
-                if path in endpoint_checks and endpoint_checks[path].get('status', 0) > 0:
-                    overrides.append(indicator_type)
-                    signals.append(f"override_{indicator_type}")
-                    break
+                if path in endpoint_checks:
+                    status = endpoint_checks[path].get('status', 0)
+                    # Only trigger overrides for true positives (2xx) or security codes (401, 403, 5xx)
+                    # Exclude redirects (3xx) as they are inconclusive
+                    if status in range(200, 300) or status in [401, 403] or status in range(500, 600):
+                        overrides.append(indicator_type)
+                        signals.append(f"override_{indicator_type}")
+                        break
 
     # Authentication and technology detection bonuses
     auth_bonus = 0
@@ -1682,7 +1934,7 @@ def calculate_host_score(host_data: Dict[str, Any], enrichment_data: Dict[str, A
 
     score += auth_bonus
 
-    # CORS and security headers
+    # CORS headers
     if enrichment_data.get('cors'):
         score += 1
         signals.append("cors_headers_present")
@@ -1813,11 +2065,6 @@ def create_manual_review_outputs(consolidated_results: List[Dict[str, Any]],
 
                 # Enrichment data
                 enrichment = host_data.get('enrichment', {})
-                if enrichment.get('security_headers'):
-                    f.write("\n**Security Headers:**\n")
-                    for header, info in enrichment['security_headers'].items():
-                        status = "Present" if info.get('present') else "Missing"
-                        f.write(f"- {header}: {status}\n")
 
                 f.write("\n---\n\n")
 
@@ -1924,7 +2171,12 @@ def consolidate_results(targets: List[str], all_hosts: Set[str], http_results: L
         log_info(f"Calculating security scores for {len(live_hosts_for_scoring)} live hosts", logger)
 
     scored_hosts = 0
+    total_hosts = len(host_data)
+    hosts_processed = 0
+
     for host in host_data:
+        hosts_processed += 1
+
         if host in enrichment_results:
             host_data[host]['enrichment'] = enrichment_results[host]
 
@@ -1937,6 +2189,10 @@ def consolidate_results(targets: List[str], all_hosts: Set[str], http_results: L
             host_data[host]['high_value_hits'] = high_value_hits
             host_data[host]['manual_review_candidate'] = score >= manual_threshold or len(overrides) > 0
             scored_hosts += 1
+
+        # Progress tracking for large scans (every 100 hosts)
+        if hosts_processed % 100 == 0 or hosts_processed == total_hosts:
+            log_info(f"Consolidation progress: {hosts_processed}/{total_hosts} hosts processed, {scored_hosts} scored", logger)
 
     if enable_scoring and scored_hosts > 0:
         manual_review_count = len([h for h in host_data.values() if h.get('manual_review_candidate')])
@@ -2128,6 +2384,8 @@ class ReconUIHandler(SimpleHTTPRequestHandler):
                 <th>HTTP Services</th>
                 <th>Overrides</th>
                 <th>High-value hits</th>
+                <th>JS Files</th>
+                <th>DNS Records</th>
                 <th>Signals</th>
                 <th>Notes</th>
             </tr>
@@ -2190,6 +2448,74 @@ class ReconUIHandler(SimpleHTTPRequestHandler):
                 const signals = result.signals ? result.signals.join(', ') : '';
                 const notes = result.notes ? result.notes.length : 0;
 
+                // Format JS files information
+                let jsFilesInfo = 'None';
+                if (result.enrichment && result.enrichment.js_files && result.enrichment.js_files.length > 0) {{
+                    const jsFiles = result.enrichment.js_files;
+                    const totalEndpoints = jsFiles.reduce((sum, file) => sum + (file.endpoints_found || 0), 0);
+                    jsFilesInfo = `${{jsFiles.length}} files, ${{totalEndpoints}} endpoints`;
+
+                    // Create tooltip with file details
+                    const fileDetails = jsFiles.map(file =>
+                        `${{file.name}}: ${{file.endpoints_found || 0}} endpoints (${{file.status}})`
+                    ).join('\\n');
+                    jsFilesInfo = `<span title="${{fileDetails}}">${{jsFilesInfo}}</span>`;
+                }}
+
+                // Format DNS records information (security-relevant records)
+                let dnsRecordsInfo = 'None';
+                if (result.dns && typeof result.dns === 'object') {{
+                    const dns = result.dns;
+                    const relevantRecords = [];
+
+                    if (dns.txt_records && dns.txt_records.length > 0) {{
+                        relevantRecords.push(`TXT(${{dns.txt_records.length}})`);
+                    }}
+                    if (dns.mx_records && dns.mx_records.length > 0) {{
+                        relevantRecords.push(`MX(${{dns.mx_records.length}})`);
+                    }}
+                    if (dns.cname_records && dns.cname_records.length > 0) {{
+                        relevantRecords.push(`CNAME(${{dns.cname_records.length}})`);
+                    }}
+                    if (dns.ns_records && dns.ns_records.length > 0) {{
+                        relevantRecords.push(`NS(${{dns.ns_records.length}})`);
+                    }}
+                    if (dns.caa_records && dns.caa_records.length > 0) {{
+                        relevantRecords.push(`CAA(${{dns.caa_records.length}})`);
+                    }}
+                    if (dns.srv_records && dns.srv_records.length > 0) {{
+                        relevantRecords.push(`SRV(${{dns.srv_records.length}})`);
+                    }}
+
+                    if (relevantRecords.length > 0) {{
+                        dnsRecordsInfo = relevantRecords.join(', ');
+
+                        // Create detailed tooltip
+                        const dnsDetails = [];
+                        if (dns.txt_records && dns.txt_records.length > 0) {{
+                            const txtSample = dns.txt_records.slice(0, 3).join('\\n');
+                            dnsDetails.push(`TXT Records (${{dns.txt_records.length}}):\\n${{txtSample}}${{dns.txt_records.length > 3 ? '\\n...' : ''}}`);
+                        }}
+                        if (dns.mx_records && dns.mx_records.length > 0) {{
+                            dnsDetails.push(`MX Records: ${{dns.mx_records.join(', ')}}`);
+                        }}
+                        if (dns.cname_records && dns.cname_records.length > 0) {{
+                            dnsDetails.push(`CNAME Records: ${{dns.cname_records.join(', ')}}`);
+                        }}
+                        if (dns.ns_records && dns.ns_records.length > 0) {{
+                            dnsDetails.push(`NS Records: ${{dns.ns_records.join(', ')}}`);
+                        }}
+                        if (dns.caa_records && dns.caa_records.length > 0) {{
+                            dnsDetails.push(`CAA Records: ${{dns.caa_records.join(', ')}}`);
+                        }}
+                        if (dns.srv_records && dns.srv_records.length > 0) {{
+                            dnsDetails.push(`SRV Records: ${{dns.srv_records.join(', ')}}`);
+                        }}
+
+                        dnsRecordsInfo = `<span title="${{dnsDetails.join('\\n\\n')}}">${{dnsRecordsInfo}}</span>`;
+                    }}
+                }}
+
                 row.innerHTML = `
                     <td>${{result.host}}</td>
                     <td class="${{scoreClass}}">${{result.score}}</td>
@@ -2200,6 +2526,8 @@ class ReconUIHandler(SimpleHTTPRequestHandler):
                     <td>${{httpServices}}</td>
                     <td>${{overrides}}</td>
                     <td>${{highValueHits}}</td>
+                    <td>${{jsFilesInfo}}</td>
+                    <td>${{dnsRecordsInfo}}</td>
                     <td>${{signals}}</td>
                     <td>${{notes}} notes</td>
                 `;
@@ -2623,19 +2951,24 @@ Examples:
                     args.user_agent, args.timeout, args.enable_get,
                     args.max_js_per_host, args.max_bytes, args.dry_run
                 )
+        else:
+            enrichment_results = {}
 
-        # Consolidate results with scoring
+        # Consolidate results with scoring and generate outputs
+        log_info("Starting result consolidation and security scoring phase", logger)
         consolidated_results = consolidate_results(
             targets, all_hosts, http_results, in_scope_patterns, out_of_scope_patterns,
             host_sources, host_notes, rate_limiter, logger, dns_results,
             enrichment_results, args.enable_scoring, args.manual_threshold
         )
 
-        # Write main results
+        # Write main results and generate reports
+        log_info("Writing consolidated results and generating reports", logger)
         write_results(consolidated_results, run_dir, run_metadata, logger)
 
         # Create manual review outputs if scoring is enabled
         if args.enable_scoring:
+            log_info("Generating manual review outputs and security prioritization", logger)
             create_manual_review_outputs(consolidated_results, run_dir, logger, args.manual_threshold)
 
         log_info("Reconnaissance completed successfully", logger)
